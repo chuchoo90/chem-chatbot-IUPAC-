@@ -163,6 +163,13 @@ def start_quiz():
     st.session_state.gave_up_count = 0
     st.session_state.give_up_mode = False
     st.session_state.confirm_quit_all = False
+
+    # [수정] 연습을 반복하면 이전 회차의 정답 수가 그대로 누적되던 문제를 막습니다.
+    st.session_state.first_try_correct = 0
+    st.session_state.second_try_correct = 0
+
+    # [신규] 현재 문항에서 학생에게 이미 준 힌트를 보관합니다.
+    st.session_state.last_hint = ""
     st.session_state.chat_history = []
     st.session_state.is_taking_test = True
 
@@ -368,6 +375,47 @@ def sanitize_hint(hint, ans1, ans2):
 
 
 # ─────────────────────────────────────────────
+# [신규] 답안 없이 힌트만 생성 (학생이 "모르겠어요"라고 한 경우)
+# ─────────────────────────────────────────────
+HINT_SYSTEM_PROMPT = """
+당신은 고등학교 유기화학 명명법을 지도하는 AI 교사입니다.
+학생이 답을 전혀 쓰지 못하고 "모르겠다"고 한 상황입니다.
+정답을 알려주지 말고, 학생이 스스로 첫 단계를 밟을 수 있도록 힌트를 만드세요.
+
+[규칙]
+- 정답 이름이나 그 일부(모체 이름, 접두사, 위치 번호)를 절대 쓰지 마십시오.
+- 지금 무엇부터 확인해야 하는지를 질문 형태로 제시하십시오.
+  예: "가장 긴 탄소 사슬을 먼저 찾아볼까요? 탄소가 몇 개인가요?"
+- 한국어로 두 문장 이내로 짧게 작성하십시오.
+
+[출력 형식 - 반드시 이 형식만 출력]
+HINT: 힌트 내용
+"""
+
+
+def generate_hint(structure, ans1, ans2):
+    """
+    [신규] 학생 답안이 없을 때 쓰는 힌트 생성기입니다.
+    실패하더라도 sanitize_hint가 기본 힌트를 돌려주므로 항상 힌트가 나갑니다.
+    """
+    try:
+        client = get_genai_client()
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=f"구조식: {structure}\n정답1: {ans1}\n정답2: {ans2}",
+            config=types.GenerateContentConfig(
+                system_instruction=HINT_SYSTEM_PROMPT,
+                temperature=0.3,
+            ),
+        )
+        text = (response.text or "").strip()
+        hint = text.split("HINT:", 1)[1].strip() if "HINT:" in text else text
+        return sanitize_hint(hint, ans1, ans2)
+    except Exception:
+        return sanitize_hint("", ans1, ans2)
+
+
+# ─────────────────────────────────────────────
 # [신규] 포기 의사 감지
 # ─────────────────────────────────────────────
 # 답안에 포함되면 포기로 간주할 표현 (부분 일치)
@@ -394,6 +442,11 @@ def is_give_up(text):
     t = text.strip().lower()
     if t in GIVE_UP_EXACT:
         return True
+
+    # [신규] 영문 화합물 이름처럼 보이면 포기로 오인하지 않습니다.
+    if re.fullmatch(r"[a-z0-9,\-\(\)\[\]\s'\.]+", t) and len(re.findall(r"[a-z]", t)) >= 4:
+        return False
+
     return any(k in t for k in GIVE_UP_KEYWORDS)
 
 
@@ -430,6 +483,7 @@ def next_question_message(body):
     """현재 문항을 마치고 다음 문제 안내(또는 종료 안내)를 만듭니다."""
     st.session_state.current_q_index += 1
     st.session_state.attempt = 1
+    st.session_state.last_hint = ""   # [신규] 문항이 바뀌면 힌트도 초기화
     total = st.session_state.total_q
 
     if st.session_state.current_q_index < total:
@@ -496,7 +550,10 @@ if not st.session_state.is_taking_test:
 
 **4. 도저히 모르겠다면**
 
-`모르겠어요`, `포기` 처럼 입력하면 선택 화면이 나옵니다.
+`모르겠어요` 라고 입력하면 **정답 대신 힌트**를 먼저 드립니다.
+힌트를 보고 맞혀도 {SCORE_SECOND_TRY}점을 받으니 일단 힌트를 받아보세요.
+
+힌트를 보고도 막힌다면 한 번 더 `모르겠어요`를 입력하세요.
 **계속 풀기 / 이 문제만 포기 / 전체 포기** 중에서 고를 수 있고,
 잘못 눌렀더라도 '계속 풀기'로 돌아올 수 있습니다.
 
@@ -559,7 +616,16 @@ else:
 
         if col1.button("↩️ 계속 풀기", use_container_width=True):
             st.session_state.give_up_mode = False
-            add_msg("assistant", "좋습니다. 다시 도전해 볼까요? 답을 입력해 주세요.")
+            # [수정] 안내 문구만 띄우지 않고, 받았던 힌트를 다시 보여줍니다.
+            hint = st.session_state.get("last_hint", "")
+            if hint:
+                add_msg(
+                    "assistant",
+                    "좋습니다. 힌트를 다시 볼게요.\n\n"
+                    f"💡 **힌트**: {hint}\n\n답을 입력해 주세요.",
+                )
+            else:
+                add_msg("assistant", "좋습니다. 다시 도전해 볼까요? 답을 입력해 주세요.")
             st.rerun()
 
         if col2.button("⏭️ 이 문제만 포기", use_container_width=True):
@@ -630,13 +696,51 @@ else:
         if student_answer := st.chat_input(placeholder):
             add_msg("user", student_answer)
 
-            # [신규] 포기 의사를 먼저 확인합니다 (API 호출 없음)
+            # ─────────────────────────────────────
+            # [★핵심 수정★] 포기 의사 처리
+            #
+            # 기존 코드는 "모르겠어요"가 나오는 즉시 포기 메뉴를 띄웠습니다.
+            # 그래서 첫 시도에서 막힌 학생은 힌트를 한 번도 받지 못했고,
+            # '계속 풀기'를 눌러도 보여줄 힌트가 없어 비계가 작동하지 않았습니다.
+            #
+            # 수정: 힌트를 아직 안 본 상태(1차)라면 포기 메뉴 대신 힌트를 먼저 줍니다.
+            #       힌트를 본 뒤에도 포기하겠다고 하면 그때 선택 메뉴를 띄웁니다.
+            # ─────────────────────────────────────
             if is_give_up(student_answer):
+                if st.session_state.attempt == 1:
+                    with st.spinner("힌트를 준비하고 있어요..."):
+                        hint = generate_hint(
+                            current_q["Structure_or_Description"],
+                            current_q.get("Answer1", ""),
+                            current_q.get("Answer2", ""),
+                        )
+
+                    st.session_state.last_hint = hint
+                    st.session_state.attempt = 2
+
+                    log_to_google_sheet(
+                        st.session_state.student_id,
+                        current_q["Structure_or_Description"],
+                        student_answer,
+                        "힌트요청(1차)",
+                        hint,
+                    )
+
+                    add_msg(
+                        "assistant",
+                        "괜찮아요. 답을 바로 알려드리는 대신 힌트를 드릴게요.\n\n"
+                        f"💡 **힌트**: {hint}\n\n"
+                        f"이 힌트를 보고 맞히면 {SCORE_SECOND_TRY}점을 받습니다. "
+                        "천천히 다시 생각해 보세요.",
+                    )
+                    st.rerun()
+
+                # 힌트를 이미 본 뒤에도 포기 의사를 밝히면 선택 메뉴를 보여줍니다.
                 st.session_state.give_up_mode = True
                 add_msg(
                     "assistant",
                     "포기하시려는 것 같네요. 아래에서 선택해 주세요.\n\n"
-                    "힌트를 한 번 더 보고 싶다면 **계속 풀기**를 눌러도 됩니다.",
+                    "**계속 풀기**를 누르면 힌트를 다시 확인할 수 있습니다.",
                 )
                 st.rerun()
 
@@ -673,6 +777,7 @@ else:
             elif is_correct is False and attempt < MAX_ATTEMPTS:
                 # 첫 오답 → 힌트를 주고 같은 문제를 다시 풀게 함
                 status = f"X({attempt}차)"
+                st.session_state.last_hint = hint   # [신규] 힌트 보관
                 body = (
                     f"❌ 아직 아닙니다. 다시 생각해 볼까요?\n\n"
                     f"💡 **힌트**: {hint}"
