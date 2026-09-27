@@ -180,7 +180,7 @@ def start_quiz():
         else "🔴 **본 평가**입니다. 이 결과는 성적에 반영됩니다."
     )
 
-    first_q = selected[0]["Structure_or_Description"]
+    first_q_md = structure_display_md(selected[0])
     st.session_state.chat_history.append(
         {
             "role": "assistant",
@@ -189,7 +189,7 @@ def start_quiz():
                 f"문항마다 기회는 **두 번**이며, 첫 시도에서 틀리면 힌트를 드립니다.\n\n"
                 f"**문제 1/{len(selected)}**\n"
                 "다음 화합물의 IUPAC 이름을 영어로 작성하세요.\n\n"
-                f"### `{first_q}`"
+                f"### {first_q_md}"
             ),
         }
     )
@@ -260,6 +260,9 @@ def normalize_answer(text):
         ("\uff0c", ","), ("\u3001", ","), ("\uff08", "("), ("\uff09", ")"),
     ]:
         t = t.replace(src, dst)
+
+    # 쉼표 주변 공백 제거 ("2, 2-dimethylbutane" -> "2,2-dimethylbutane")
+    t = re.sub(r"\s*,\s*", ",", t)
 
     # 중복 공백 정리
     return re.sub(r"\s+", " ", t)
@@ -479,6 +482,17 @@ def final_summary():
     return text
 
 
+def structure_display_md(q):
+    """
+    [신규] 구조식 표시용 마크다운을 만듭니다.
+    이미지 URL이 있으면 그림으로, 없으면 기존처럼 텍스트로 보여줍니다.
+    """
+    img = q.get("Structure_Image_URL", "")
+    if isinstance(img, str) and img.strip():
+        return f"![구조식]({img.strip()})"
+    return f"`{q.get('Structure_or_Description', '')}`"
+
+
 def next_question_message(body):
     """현재 문항을 마치고 다음 문제 안내(또는 종료 안내)를 만듭니다."""
     st.session_state.current_q_index += 1
@@ -491,7 +505,7 @@ def next_question_message(body):
         return (
             f"{body}\n\n---\n"
             f"**문제 {st.session_state.current_q_index + 1}/{total}**\n"
-            f"`{nxt['Structure_or_Description']}`"
+            f"{structure_display_md(nxt)}"
         )
     return f"{body}\n\n---\n{final_summary()}"
 
