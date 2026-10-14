@@ -1,5 +1,6 @@
 import re
 import time
+import random
 import datetime
 
 import streamlit as st
@@ -38,6 +39,46 @@ st.set_page_config(page_title="유기화학 명명법 수행평가", page_icon="
 @st.cache_resource
 def get_genai_client():
     return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+
+
+def _generate_content_with_retry(contents, config, tries=4):
+    """
+    [신규] 16명 동시 응시 대비: Gemini 호출 재시도 래퍼 (2026-10-15).
+
+    - 429(분당 한도 초과)·일시적 5xx에서만 재시도합니다.
+    - 대기 시간은 지수 백오프(1→2→4초) + 지터(0~1초)로, 16명이 동시에
+      재시도해도 다시 한꺼번에 몰리지 않게 합니다.
+    - 재시도를 다 써도 실패하면 예외를 그대로 올려 기존 fail-open 경로
+      (채점보류 → 선생님 직접 확인)로 넘어갑니다.
+    """
+    client = get_genai_client()
+    last_err = None
+    for i in range(tries):
+        try:
+            return client.models.generate_content(
+                model=MODEL_NAME,
+                contents=contents,
+                config=config,
+            )
+        except errors.APIError as e:
+            last_err = e
+            code = getattr(e, "code", None)
+            msg = str(e)
+            retryable = (
+                code == 429
+                or code in (500, 502, 503, 504)
+                or "429" in msg
+                or "RESOURCE_EXHAUSTED" in msg
+                or "quota" in msg.lower()
+                or "overloaded" in msg.lower()
+            )
+            if not retryable or i == tries - 1:
+                raise
+            time.sleep(2 ** i + random.uniform(0, 1))
+        except Exception:
+            # APIError가 아닌 오류(인증 실패 등)는 재시도해도 소용없습니다.
+            raise
+    raise last_err
 
 
 @st.cache_resource
@@ -346,16 +387,11 @@ def evaluate_answer(structure, student_answer, ans1, ans2, level=""):
 
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
-        temperature=0.1,
+        # Gemini 3.6+부터 temperature는 기본값으로 강제되어 무효 — 향후 모델 에러 방지용으로 제거 (2026-10-07)
     )
 
     try:
-        client = get_genai_client()
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=user_prompt,
-            config=config,
-        )
+        response = _generate_content_with_retry(user_prompt, config)
         is_correct, feedback, hint = parse_result(response.text)
         hint = sanitize_hint(hint, ans1, ans2)   # 힌트에 정답이 섞였는지 검사
         return is_correct, feedback, hint
@@ -451,13 +487,11 @@ def generate_hint(structure, ans1, ans2, level=""):
     실패하더라도 sanitize_hint가 기본 힌트를 돌려주므로 항상 힌트가 나갑니다.
     """
     try:
-        client = get_genai_client()
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=f"난이도: {level}\n구조식: {structure}\n정답1: {ans1}\n정답2: {ans2}",
-            config=types.GenerateContentConfig(
+        response = _generate_content_with_retry(
+            f"난이도: {level}\n구조식: {structure}\n정답1: {ans1}\n정답2: {ans2}",
+            types.GenerateContentConfig(
                 system_instruction=HINT_SYSTEM_PROMPT,
-                temperature=0.3,
+                # Gemini 3.6+부터 temperature는 기본값으로 강제되어 무효 — 향후 모델 에러 방지용으로 제거 (2026-10-07)
             ),
         )
         text = (response.text or "").strip()
